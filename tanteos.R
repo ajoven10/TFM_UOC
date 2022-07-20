@@ -1,9 +1,15 @@
 library(curatedTCGAData)
 library(TCGAutils)
 library(dplyr)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylation27kanno.ilmn12.hg19)
 
 data("diseaseCodes", package="TCGAutils")
 diseaseCodes
+
+data("sampleTypes")
+sampleTypes
+
 
 ###################################################################################
 curatedTCGAData("*", "Methyl*", dry.run = TRUE, version = "1.1.38")
@@ -196,7 +202,45 @@ experimentos$`ACC_Methylation-20160128`
 experimentos$`BLCA_Methylation-20160128`
 
 # la matriz de fenotipos como un dataframe
-fenotipos <- colData(estudios_3[2])@listData %>% as.data.frame()
+fenotipos_1 <- colData(estudios)@listData %>% as.data.frame()
+fenotipos_2 <- colData(estudios_2)@listData %>% as.data.frame()
+fenotipos_3 <- colData(estudios_3)@listData %>% as.data.frame()
+fenotipos_4 <- colData(estudios_4)@listData %>% as.data.frame()
+fenotipos_5 <- colData(estudios_5)@listData %>% as.data.frame()
+fenotipos_6 <- colData(estudios_6)@listData %>% as.data.frame()
+fenotipos_7 <- colData(estudios_7)@listData %>% as.data.frame()
+fenotipos_8 <- colData(estudios_8)@listData %>% as.data.frame()
+fenotipos_9 <- colData(estudios_9)@listData %>% as.data.frame()
 
-data("sampleTypes")
-sampleTypes
+######################################################################
+#####################################################################
+# anotaciones de las sondas 450k
+
+data("IlluminaHumanMethylation450kanno.ilmn12.hg19")
+annotation.table <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+annotation.table
+dim(annotation.table)
+
+ww <- assay(estudios[[2]], "counts")[1:10,] %>% as.data.frame()
+colnames(ww) %>% substring(14,16) %>% table()
+nombres <-row.names(ww)
+
+annotation.table[nombres, c(1,2,3,24,25,26)]
+
+#######################################################################
+#######################################################################
+# anotaciones de las sondas 27k
+
+data("IlluminaHumanMethylation27kanno.ilmn12.hg19")
+annotation27.table <- getAnnotation(IlluminaHumanMethylation27kanno.ilmn12.hg19)
+annotation27.table
+dim(annotation27.table)
+
+ww <- assay(estudios_2[[1]], "counts")[1:10,] %>% as.data.frame()
+colnames(ww) %>% substring(14,16) %>% table()
+nombres <-row.names(ww)
+
+annotation27.table[nombres, c(1,2,3,30,32)]
+
+
+
