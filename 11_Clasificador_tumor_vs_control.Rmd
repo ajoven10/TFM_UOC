@@ -1,0 +1,403 @@
+---
+title: "Clasificador diseasecodes TCGA"
+author: "Alberto Joven Álvarez"
+date: \ `r format(Sys.Date(), "%e de %B, %Y")`
+bibliography: ["scholar2.bib"]
+nocite: \ @*
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 2
+    number_sections: true
+  html_document: 
+    higlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+    number_sections: true
+    toc_float: yes
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r librerias, warning=FALSE, message=FALSE}
+
+library(knitr)
+library(SummarizedExperiment)
+library(GEOquery)
+library(Rtsne)
+library(ggplot2)
+library(dplyr)
+library(sva)
+library(caret)
+library(class)
+library(C50)
+library(gmodels)
+library(keras)
+library(randomForest)
+library(googledrive)
+library(doParallel)
+library(TCGAutils)
+registerDoParallel(cores=4)
+```
+
+# Clasificador machine learning de muestras tumorales.
+
+## Descripción datos de entrada
+
+En este clasificador, como datos de entrada, se utilizan las sondas seleccionadas con los siguientes criterios:
+Arrays: Illumina methylation 450k.   
+
+Criterio de metilación diferencial: p-value ajustado BH para la diferencia de medias entre los grupos contrastados < 0.01
+Se ha contrastado cada tumor contra el conjunto de muestras de control con la función TCGAanalize que emplea el test de Wilcoxon, por ejemplo:
+
+```{r, eval=FALSE}
+
+sondas_BRCA <- TCGAanalyze_DMC(   
+  data = data,   
+  groupCol = "label",   
+  group1 = "Control",   
+  group2 = "BRCA",   
+  save.directory="G:/TFM UOC/Expresion diferencial",   
+  plot.filename ="methylation_volcano_BRCA.pdf"   
+)
+
+```
+
+Se han seleccionado las sondas que cumplían el criterio de False Discovery Rate ajustado con el criterio BH menor de 0.01, no se ha considerado un valor mínimo para la diferencia en las medias de los valores betas entre ambos grupos.
+
+El subset de sondas se obtiene por la intersección de los subconjuntos de sondas diferenciales obtenidos con los 33 contrastes tumor vs Control.
+
+
+
+## Carga inicial de los datos
+
+Carga del objeto **SummarizedExperiment** que contiene los valores betas, valores de fenotipos y rangos de las sondas seleccionadas:
+
+```{r carga_Summarized_Experiment, message=FALSE, warning=FALSE}
+
+
+# load("G:/TFM UOC/datos/data_1524sondas.Rda")
+url <- "https://drive.google.com/file/d/1mf06hvdWijT3z_hHFYEnEtAHSZ11l8po/view?usp=sharing"
+drive_download(url, overwrite = TRUE)
+
+load("data_1524sondas.Rda")
+data_1524sondas
+
+```
+
+## Sondas problemáticas de acuerdo a [@price2013additional]
+
+Carga del fichero GSE42409_family.soft:
+
+```{r carga_GSE42409, warning=FALSE, message=FALSE, cache=TRUE}
+
+elist <- getGEO("GSE42409")
+GSE42409 <- elist[[1]] %>% featureData()
+
+```
+
+El porcentaje de sondas que apuntan a SNPs. Las identifico (no estoy seguro de que sea la forma correcta) con la variable: `Target CpG SNP`, presumo que las sondas que apuntan a SNP´s son aquellas que tienen dicha variable no vacía.
+
+```{r}
+sum(GSE42409$`Target CpG SNP` != "") * 100 / dim(GSE42409)[1]
+```
+
+El porcentaje de sondas con más de un sitio de unión en el genoma. Las identifico si la variable `AlleleA_Hits` no es igual a 1 (tampoco estoy seguro de que sea la forma corresta).
+
+```{r, message=FALSE, warning=FALSE}
+
+sum(GSE42409$AlleleA_Hits != 1) * 100 / dim(GSE42409)[1]
+
+```
+
+Sondas de nuestra selección que apuntan a SNPs:
+
+```{r, message=FALSE, warning=FALSE}
+
+sondas_1524 <- GSE42409[GSE42409$ID %in% rownames(data_1524sondas), ]
+sum(sondas_1524$`Target CpG SNP` != "")
+
+```
+
+Sondas de nuestra selección con más de un sitio de unión:
+
+```{r, message=FALSE, warning=FALSE}
+
+sum(sondas_1524$AlleleA_Hits != 1)
+
+```
+
+Suprimo estos dos tipos de sondas problemáticas:
+
+
+```{r eliminacion_sondas_GSE42409}
+
+s1 <- sondas_1524[sondas_1524$`Target CpG SNP` != "" | sondas_1524$AlleleA_Hits != 1,] %>% row.names()
+data_sondas <- data_1524sondas[!(row.names(data_1524sondas) %in% s1)]
+                     
+data_sondas
+
+betas <- assay(data_sondas, "counts")
+rangos_sondas <- rowRanges(data_sondas)
+fenotipos <- colData(data_sondas)
+
+etiqueta <- as.factor(fenotipos$label)
+
+```
+
+## Gráfico previo Rtsne
+
+```{r Rtsne_grafico, message=FALSE, warning=FALSE, cache=TRUE}
+
+sed.seed=123
+tsne <- Rtsne(t(betas), partial_pca=TRUE, dims=2, perplexity=30, verbose =FALSE, max_iter=1000 )
+
+# Gráfico por patologías
+tsne_plot <- data.frame(x = tsne$Y[,1], y = tsne$Y[,2], col = etiqueta)
+ggplot(tsne_plot) + geom_point(aes(x=x, y=y, color=col), size=0.2)
+
+
+```
+
+Distribución de las sondas seleccionadas según la clase de CpG a la que apuntan:
+
+```{r, message=FALSE, warning=FALSE}
+
+
+t1 <- table(GSE42409$HIL_CpG_class)
+t2 <- table(sondas_1524$HIL_CpG_class)
+(t <- rbind(t1, t2)) %>% kable()
+t1_p <- table(GSE42409$HIL_CpG_class) %>% prop.table() %>% round(2)
+t2_p <- table(sondas_1524$HIL_CpG_class) %>% prop.table() %>% round(2)
+kable(rbind(t1_p, t2_p))
+chisq.test(t)
+
+```
+
+El box-plot de las muestras, agrupado por tumores:
+
+```{r boxplot_muestras}
+boxplot(t(betas) ~ etiqueta, cex.axis=0.5, las=3, col=palette())
+```
+
+## Estimación efectos covariates (efecto batch)
+
+### Librería sva para estimar las variables batch
+
+Esta estimación se hace con la librería `sva`. De acuerdo con la ayuda de la función `sva`: *Esta función es la implementación del método de mínimos cuadrados ponderados iterativamente para estimar variables sustitutas.*
+
+```{r efecto_batch, cache=TRUE, message=FALSE, warning=FALSE}
+
+mod <- model.matrix( ~ label, data=fenotipos)
+mod0 <- model.matrix( ~ 1, data=fenotipos)
+
+n.sv = num.sv(betas, mod, method="leek")
+n.sv
+
+sva1 <- sva(betas, mod, mod0, n.sv=2)
+# sale sva1$sv una matriz de  9707 x 2
+# la primera columna un 1 en la primera posición y luego todos ceros
+# la segunda columna un 1 en la segunda posición y luego todo ceros
+sva1[[1]] %>% head()
+
+```
+
+No se detecta ningún efecto **batch** con este sistema. Otro sistema alternativo como identificar a priori las `covariates` que influyen en la variable respuesta, creo que no es aplicable en este caso, al no disponer de datos masivos de todas las muestras de los valores de pureza tumoral, centro donde se realizaron los análisis o fecha de los mismos.
+
+### Librería sva utilizando com variable batch el plate_id del barcode
+
+```{r sva_batch_plate_id, warning=FALSE, message=FALSE}
+
+nombres <-  colnames(betas)
+plate_id <- TCGAbiospec(nombres) 
+plate_id <- plate_id$plate
+
+fenotipos$plate_id <- plate_id
+
+mod0 <- model.matrix( ~ 1, data = fenotipos)
+mod <- model.matrix( ~ as.factor(label), data = fenotipos)
+
+combat_edata <- ComBat(dat = betas, batch = plate_id,
+                       mod = mod0, par.prior=TRUE, mean.only=TRUE)
+
+
+assay(data_sondas, "counts") <- combat_edata
+
+```
+
+
+
+## Desglose entre muestras de entrenamiento y test
+
+En esta primera aproximación separo el 75 % de las observaciones para entrenamiento y el 25% restante para test.
+
+```{r train_test, warning=FALSE, message=FALSE}
+
+set.seed(123)
+in_train <- createDataPartition(etiqueta, p=0.75, list=FALSE)
+
+train <- data_sondas[ , as.vector(in_train)]
+test <- data_sondas[ , as.vector(-in_train)] 
+
+df <- data.frame(Train= table(colData(train)$label), 
+                 Test = table(colData(test)$label),
+                 Total = table(colData(data_sondas)$label))
+
+df[, c(1,2,4,6) ] %>% kable()
+
+betas_train <- assay(train, "counts") %>% t()
+fenotipos_train <- colData(train)$label %>% factor(ordered=TRUE)
+
+betas_test <- assay(test, "counts") %>% t()
+fenotipos_test <- colData(test)$label %>% factor(ordered=TRUE)
+
+
+```
+
+## Algoritmo k-Nearest
+
+Este algoritmo asigna la clase **Tipo tumor**  de las observaciones test a la clase mayoritaria de las *k* observaciones más cercanas.
+
+
+
+Estimación del modelo:
+
+Inicialmente probamos con un modelo con el valor del parámetro k que indica el número de observaciones vecinas a considerar en la clasificación, igual a 5. 
+
+Se utiliza la función `knn` del paquete `class`.
+
+```{r modelo_knn}
+modelo_knn <- class::knn(betas_train, betas_test, cl=fenotipos_train, k=10) 
+
+```
+
+Evaluación del modelo
+
+Se utiliza la función confusionMatrix del paquete caret para evaluar el modelo con los datos del grupo de observaciones test.  
+
+
+
+```{r k_nearest}
+                   
+c1 <- confusionMatrix(modelo_knn, fenotipos_test, positive="Control" )
+c1
+
+```
+
+El modelo resultante da un valor de *accuracy* de `r round(c1$overall[1], 2)` y del parámetro Kappa de `r round(c1$overall[2], 2)` que de acuerdo con el texto @lantz2015machine, es considerado como excelente. El valor de la *sensitivity* del modelo es `r c1$byClass[1] %>% round(2)`, este es el tanto por uno de casos malignos que han sido detectados por el algoritmo.
+
+
+## Algoritmo árbol de decisión
+
+```{r arbol_decision, cache=TRUE}
+modelo_arbol <- C5.0(betas_train, fenotipos_train, trials=10)
+modelo_arbol
+
+prediccion <- predict(modelo_arbol, betas_test)
+c2 <- confusionMatrix(fenotipos_test, prediccion )
+c2
+
+
+```
+
+## Algoritmo red neuronal
+
+```{r red_neuronal, cache=TRUE}
+
+red <- keras_model_sequential() %>%
+  layer_dense(units = 2000, activation="relu", input_shape=1492) %>%
+  layer_dense(units = 35, activation ="softmax")
+
+red %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+
+train_labels <- to_categorical(as.integer(fenotipos_train))
+test_labels <- to_categorical(as.integer(fenotipos_test))
+
+red
+
+hist <- red %>% fit(betas_train, train_labels, 
+                    epoch=30, batch_size=128,
+                    validation_data = list(betas_test, test_labels))
+plot(hist)
+
+metrics <- red %>% evaluate(betas_test, test_labels)
+metrics
+
+prediccion <- red %>% predict(betas_test) %>% k_argmax() %>% 
+              as.array() %>% as.integer()
+
+l <- as.list(1:34)
+names(l) <- levels(fenotipos_test)
+f <- names(l)[prediccion]
+lev <- levels(fenotipos_test)
+prediccion <- factor(f, levels=lev)
+
+c3 <- confusionMatrix(fenotipos_test, prediccion)
+c3
+
+
+```
+
+## Algoritmo randomforest
+
+```{r random_forest, warning=FALSE, cache=TRUE, message=FALSE}
+
+be <- as.data.frame(betas_train)
+be$label <- fenotipos_train
+modelo_rf <- randomForest(label ~., data=be, ntree=40,
+                          importance=TRUE)
+
+resultado <- predict(modelo_rf, newdata=betas_test, type="class")
+
+c4 <- confusionMatrix(fenotipos_test, resultado)
+c4
+
+```
+
+El modelo resultante da un valor de *accuracy* de `r round(c4$overall[1], 2)` y del parámetro Kappa de `r round(c4$overall[2], 2)`. El valor de la *sensitivity* del modelo es `r c4$byClass[1] %>% round(2)`. 
+
+## Best model randomforest con caret
+
+```{r randomforet_with_caret, warning=FALSE, cache=TRUE, message=FALSE}
+
+ctrl <- trainControl(method ="repeatedcv",
+                     number=5, repeats=5,
+                     selectionFunction="best",
+                     savePredictions=TRUE,
+                     classProbs=TRUE, 
+                     verboseIter=TRUE,
+                     allowParallel=TRUE)
+
+grid_rf <- expand.grid(mtry = c(60, 80, 100, 120, 140))
+                              
+
+m_rf <- train(label ~ ., data=be, method="rf",
+              trControl=ctrl,
+              tuneGrid=grid_rf,
+              metric="Accuracy")
+
+m_rf
+
+resultado2 <- predict(m_rf, newdata=betas_test, type="raw")
+
+c5 <- confusionMatrix(fenotipos_test, resultado2)
+c5
+
+```
+
+
+## Bibliografía
+
+
+
+
+

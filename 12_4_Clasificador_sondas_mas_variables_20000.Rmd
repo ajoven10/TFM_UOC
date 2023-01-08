@@ -1,0 +1,858 @@
+---
+title: "Clasificador diseasecodes TCGA. Red neuronal con sondas de mayor variabilidad"
+author: "Alberto Joven Álvarez"
+date: \ `r format(Sys.Date(), "%e de %B, %Y")`
+bibliography: ["scholar2.bib"]
+nocite: \ @*
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 2
+    number_sections: true
+  html_document: 
+    higlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+    number_sections: true
+    toc_float: yes
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Lista de librerías empleadas
+
+```{r librerias, warning=FALSE, message=FALSE}
+
+library(knitr)
+library(dplyr)
+library(readr)
+library(curatedTCGAData)
+library(TCGAutils)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(FDb.InfiniumMethylation.hg19)
+library(impute)
+library(SummarizedExperiment)
+library(GEOquery)
+library(caret)
+library(FactoMineR)
+library(factoextra)
+library(Rtsne)
+library(ggplot2)
+library(keras)
+library(sva)
+library(randomForest)
+
+```
+
+# Planteamiento general del trabajo
+
+Se plantea como pregunta inicial de interés biológico:   
+
+¿Es posible entrenar una red neuronal para que a partir de los datos de posiciones metiladas de una muestra sea capaz de identificar a qué categoría de tejido pertenece clasificándola en una de las 34 clases de tumores que establece el proyecto The Cancer Genome Atlas o bien considerarla como muestra no tumoral?
+
+Este trabajo se inspira en el artículo [@capper2018dna] que propone un clasificador Machine Learning para la determinación del tipo de tumor del SNC a partir de los datos de metilación (betavalues) de las 20.000 sondas del array Illumina 450k que presentan una mayor variabilidad. También ha servido de guía el planteamiento descrito en [@maros2020machine] que expone una aplicación general de esa metodología.
+
+En breve síntesis el trabajo ha consistido en:  
+
+1. Descarga de los datos: desde el repositorio del Broad Institute GDAC Firehouse se descargaron todos los análisis del proyecto TCGA con datos de metilación obtenidos con sondas Illumina 450k.
+2. Se construye un objeto R *Summarized Experiment* a partir de los valores betas de todos los estudios, una vez suprimidas las sondas con más de un 10% de muestras con valor ausente.
+3. Se eliminan las sondas previsiblemente problemáticas de acuerdo con los trabajos [@price2013additional] y [@zhou2017comprehensive].
+4. Se seleccionan las muestras con códigos TCGA: 1 "Primary Solid Tumor" y 03 "Primary Blood Derived Cancer-Peripheral Blood" (TB).
+5. Se desglosan las muestras en los grupos train y test (75% y 25%) utilizando la librería *caret* [@max2017caret].
+6. Se calcula la desviación estándar de las sondas, seleccionándose las 20.000 sondas con mayor variabilidad.
+7. Análisis gráfico previo: se muestran los gráficos de componentes principales y la técnica t-SNE (Stochastic Neighbor Embedding), así como los histogramas las sondas con mayor variabilidad, para ello empleo el grupo de sondas de mayor variabilidad y el grupo de muestras *train*.
+8. Se diseña el algoritmo Red Neuronal y se evalúa mediante cross-validation entrenando tan solo con las muestras *train*. 
+9. Se selecciona el algoritmo de mejor resultado y se evalúa con las muestras *test*.
+10. Se entrena un algoritmo random Forest y se evalúa su grado de acierto.
+
+## Tabla de códigos de tumor del proyecto TCGA
+
+El detalle de los códigos de tumor del TCGA usados en este cuaderno es:
+
+```{r codigos_tumor, warning=FALSE, message=FALSE}
+
+read.delim("C:/TFM UOC/R/codigos_tumores.txt",  sep="\t") %>% kable()
+
+```
+
+## Tabla con los códigos de las muestras
+
+El detalle de los códigos de las muestras TCGA usados en este cuaderno es:
+
+```{r codigos_muestras, warning=FALSE, message=FALSE}
+
+read.table("C:/TFM UOC/R/codigos_muestras.txt", head=TRUE, sep="\t") %>% kable()
+
+```
+
+En este trabajo usaré solo las muestras de códigos 01 Primary Solid Tumor (TP), 03 Primary Blood Derived Cancer - Peripheral Blood (TB).
+
+## Detalle de las muestras descargadas para el estudio
+
+```{r muestras, warning=FALSE, message=FALSE}
+
+read_delim("C:/TFM UOC/R/muestras.txt", delim = "\t", 
+    escape_double = FALSE, col_types = cols(TP = col_integer()), 
+    trim_ws = TRUE)  %>%  kable()
+
+```
+
+# Descarga de los datos
+
+## Obtención de los beta_values
+
+El código empleado para la descarga de los datos fue:
+
+```{r codigo_descarga, eval=FALSE}
+
+estudios <- curatedTCGAData(
+  diseaseCode = c("ACC", "BLCA"), assays = "Methyl*", version = "1.1.38", dry.run = FALSE
+)
+
+```
+
+Sucesivamente se descargaron los 33 códigos de tumor que se han detallado anteriormente (en el ejemplo de código solo estan los códigos **ACC** y **BLCA**).
+
+Con el código siguiente se extrajo uno a uno la información (objetos) contenida en las descargas anteriores. Este código se ejecuta para cada uno de los 33 assays expuestos en la primera columna de la tabla anterior:
+
+```{r codigo_extraer, eval=FALSE}
+
+matriz1 <- assays(estudios)
+matriz1 <- matriz1[["BLCA_Methylation-20160128"]]
+matriz1 <- as.matrix(matriz1)
+
+matriz2 <- assays(estudios)
+matriz2 <- matriz2[["ACC_Methylation-20160128"]]
+matriz2 <- as.matrix(matriz2)
+
+```
+
+El paso siguiente fue unir sucesivamente una a una (en otro caso daba error) las matrices con los valores betas con *cbind*:
+
+
+```{r codigo_unir_matrices, eval=FALSE}
+
+matriz <- cbind(matriz1, matriz2)
+rm(matriz1, matriz2)
+
+matriz <- cbind(matriz, matriz3)
+rm(matriz3)
+
+
+```
+
+## Tratamiento de los datos faltantes
+
+Tratamiento de los valores faltantes **NAs**: se eliminaron las sondas con más del 10% de las observaciones NAs, quedan 395319: 
+
+```{r tratamiento_NAS, eval =FALSE}
+
+matriz2 <- matriz[nas < 9707 * 0.1, ]
+
+```
+
+El resto de valors faltantes se imputaron con la función *impute* de la librería del mismo nombre, que utiliza el nearest neighbor averaging para su cálculo. Se divide la matriz de datos en 9 tramos para posibilitar el cálculo y, una vez calculada la estimación de lo valores faltantes, se vuelven a unir. El código utilizado fue:
+
+```{r impute, eval=FALSE}
+
+library(impute)
+
+matriz3 <- matriz2[ , 1:1000]
+matriz4 <- matriz2[ , 1001:2000]
+matriz5 <- matriz2[ , 2001:3000]
+matriz6 <- matriz2[ , 3001:4000]
+matriz7 <- matriz2[ , 4001:5000]
+matriz8 <- matriz2[ , 5001:6000]
+matriz9 <- matriz2[ , 6001:7000]
+matriz10 <- matriz2[ , 7001:8000]
+matriz11 <- matriz2[ , 8001:9000]
+matriz12 <- matriz2[ , 9001:9707]
+
+rm(matriz2)
+
+matriz33 <- impute.knn(matriz3)
+matriz44 <- impute.knn(matriz4)
+matriz55 <- impute.knn(matriz5)
+matriz66 <- impute.knn(matriz6)
+matriz77 <- impute.knn(matriz7)
+matriz88 <- impute.knn(matriz8)
+matriz99 <- impute.knn(matriz9)
+matriz1010 <- impute.knn(matriz10)
+matriz1111 <- impute.knn(matriz11)
+matriz1212 <- impute.knn(matriz12)
+
+
+matriz_sna <- cbind(matriz33$data, matriz44$data, matriz55$data, matriz66$data, 
+                    matriz77$data, matriz88$data,
+                    matriz99$data, matriz1010$data, matriz1111$data, matriz1212$data)
+
+```
+
+## Construcción de Data Frame con los fenotipos de las muestras
+
+El Data.Frame con los fenotipos de las muestras lo construyo manualmente. Los campos a incorporar son:  
+
+1. Nombre de las muestras: el bar-code que identifica cada muestra en la matriz con los beta-values.
+2. Bar-code: El bar-code de identificación de las muestras.
+3. El identificador de individuo (los 12 primeros caracteres del bar-code).
+4. Categoría: es el tipo de muestra: 01 Tumor primario, 11 Tejido normal etc...
+5. type: es la descripción del tumor extraída de los datos de fenotipos de cada ensayo: Histological Type
+6. disease_code: tipo de tumor extraído de lkos datos de fenotipos de cada ensayo.
+7. assay: identifica el ensayo.
+8. label: si la muestra es tumoral, figura el identificador del ensayo. Si la muestra no es tumoral, código de muestra "11" figura la categoría "Control".
+
+
+
+```{r etiquetas, eval=FALSE}
+
+# Se carga la matriz con todos los datos betas de todos los ensayos descargados: 
+# sus columnas están rotuladas con los  bar-codes.
+
+load("G:/TFM UOC/datos/matriz.Rda")
+
+# Se cargan los objetos MultiassayExperiment descargados anteriormente
+
+load(file="G:/TFM UOC/estudios/estudios_1")
+load(file="G:/TFM UOC/estudios/estudios_2")
+load(file="G:/TFM UOC/estudios/estudios_3")
+load(file="G:/TFM UOC/estudios/estudios_4")
+load(file="G:/TFM UOC/estudios/estudios_5")
+load(file="G:/TFM UOC/estudios/estudios_6")
+load(file="G:/TFM UOC/estudios/estudios_7")
+load(file="G:/TFM UOC/estudios/estudios_8")
+load(file="G:/TFM UOC/estudios/estudios_9")
+load(file="G:/TFM UOC/estudios/estudios_10")
+
+# Los bar-codes y los 12 primeros caracteres de los mismos
+# forman los dos primeros campos.
+
+etiqueta <- data.frame(bar_code = colnames(matriz), 
+                       sujeto=substring(colnames(matriz), 1, 12))
+etiqueta$categoria <- substring(colnames(matriz), 14,15) %>% as.factor()
+
+# para añadir el histological_type y el disease_code
+
+fenotipos1 <- colData(estudios)
+fenotipos2 <- colData(estudios_2)
+fenotipos3 <- colData(estudios_3)
+fenotipos4 <- colData(estudios_4)
+fenotipos5 <- colData(estudios_5)
+fenotipos6 <- colData(estudios_6)
+fenotipos7 <- colData(estudios_7)
+fenotipos8 <- colData(estudios_8)
+fenotipos9 <- colData(estudios_9)
+fenotipos10 <- colData(estudios_10)
+tipos1 <- data.frame(sujeto = rownames(fenotipos1), 
+                     type = fenotipos1$histological_type, 
+                     disease_code=fenotipos1$admin.disease_code)
+tipos2 <- data.frame(sujeto = rownames(fenotipos2), 
+                     type = fenotipos2$histological_type,
+                     disease_code=fenotipos2$admin.disease_code)
+tipos3 <- data.frame(sujeto = rownames(fenotipos3), 
+                     type = fenotipos3$histological_type,
+                     disease_code=fenotipos3$admin.disease_code)
+tipos4 <- data.frame(sujeto = rownames(fenotipos4),
+                     type = fenotipos4$histological_type, 
+                     disease_code=fenotipos4$admin.disease_code)
+tipos5 <- data.frame(sujeto = rownames(fenotipos5), 
+                     type = fenotipos5$histological_type, 
+                     disease_code=fenotipos5$admin.disease_code)
+tipos6 <- data.frame(sujeto = rownames(fenotipos6), 
+                     type = fenotipos6$histological_type, 
+                     disease_code=fenotipos6$admin.disease_code)
+tipos7 <- data.frame(sujeto = rownames(fenotipos7), 
+                     type = fenotipos7$histological_type,
+                     disease_code=fenotipos7$admin.disease_code)
+tipos8 <- data.frame(sujeto = rownames(fenotipos8), 
+                     type = fenotipos8$histological_type, 
+                     disease_code=fenotipos8$admin.disease_code)
+tipos9 <- data.frame(sujeto = rownames(fenotipos9), 
+                     type = fenotipos9$histological_type, 
+                     disease_code=fenotipos9$admin.disease_code)
+tipos10 <- data.frame(sujeto = rownames(fenotipos10), 
+                      type = fenotipos10$histological_type, 
+                      disease_code=fenotipos10$admin.disease_code)
+
+tipos <- rbind(tipos1, tipos2, tipos3, tipos4, tipos5, tipos6, 
+               tipos7, tipos8, tipos9, tipos10)
+
+etiqueta <- merge(etiqueta, tipos, by="sujeto", all.x=TRUE)
+
+# Para añadir el estudio assay
+
+maps1 <- as.data.frame(sampleMap(estudios))
+maps2 <- as.data.frame(sampleMap(estudios_2))
+maps3 <- as.data.frame(sampleMap(estudios_3))
+maps4 <- as.data.frame(sampleMap(estudios_4))
+maps5 <- as.data.frame(sampleMap(estudios_5))
+maps6 <- as.data.frame(sampleMap(estudios_6))
+maps7 <- as.data.frame(sampleMap(estudios_7))
+maps8 <- as.data.frame(sampleMap(estudios_8))
+maps9 <- as.data.frame(sampleMap(estudios_9))
+maps10 <- as.data.frame(sampleMap(estudios_10))
+
+tipos_2 <- rbind(maps1, maps2, maps3, maps4, maps5, maps6, 
+                 maps7, maps8, maps9, maps10)
+tipos_2$assay <- as.character(tipos_2$assay)
+ensayos <- strsplit(tipos_2$assay, split="_")
+ensayos <- lapply(ensayos, "[", 1) %>% unlist()
+tipos_2$assay <- ensayos
+
+# elimino duplicados en los indicadores de muestra
+tipos_2 <- tipos_2[!duplicated(tipos_2$colname), c(1,3) ]
+
+etiqueta <- merge(etiqueta, tipos_2, by.x="bar_code", by.y= "colname", all.x=TRUE)
+rownames(etiqueta) <- etiqueta$bar_code
+
+etiqueta$label <- etiqueta$assay
+etiqueta$label[etiqueta$categoria == "11"] <- "Control"
+
+# muestras puestas en el mismo orden que la matriz de expresión
+etiqueta <- etiqueta[colnames(matriz), ]
+
+table(etiqueta$assay, useNA="always")
+table(etiqueta$label, useNA="always")
+
+sum(colnames(matriz) != rownames(etiqueta))
+
+sujetos <- unique(etiqueta$sujeto)
+table(table(etiqueta$sujeto))
+
+```
+
+El data.frame etiqueta, al final tiene el siguiente aspecto (se traspone para mejor visualización:
+
+```{r}
+etiqueta <- read.table("C:/TFM UOC/R/etiqueta.txt")
+
+kable(t(etiqueta[1:2, ] ))
+
+```
+
+
+## Granges con las anotaciones de las sondas
+
+Se obtienen de las anotaciones de Illumina.
+
+```{r granges, eval=FALSE}
+
+sondas <- get450k()
+sondas <- sondas[rownames(matriz_sna)]
+
+```
+
+## Construcción del objeto Summarized Experiment
+
+```{r summarized_experiment, eval = FALSE}
+
+data <- SummarizedExperiment::SummarizedExperiment(
+  assays=S4Vectors::SimpleList(counts=matriz_sna),
+  rowRanges = sondas,
+  colData = etiqueta
+)
+
+```
+
+# Selección de las 20000 sondas con mayor variabilidad
+
+## Exclusión de sondas problemáticas de acuerdo a [@price2013additional] y [@zhou2017comprehensive]
+
+### Descarga de las anotaciones adicionales de las sondas 
+
+Se descargan las anotaciones adicionales de las sondas desde la documentación adicional de [@price2013additional]
+
+```{r descarga_GSE42409, warning=FALSE, message=FALSE, eval=FALSE}
+
+elist <- getGEO("GSE42409")
+GSE42409 <- elist[[1]] %>% featureData()
+
+```
+
+### Supresión de sondas problemáticas
+
+Se excluirán las sondas identificadas con:  
+
+1. Aquellas cuya denominación comienza con rs o ch: identificadas como SNP por las anotaciones de Illumina o que no están mapeadas al genoma.
+2. Las que tienen en el fichero de anotación adicional de [@price2013additional] el campo `Target CpG SNP` no vacío.
+3. Las que tiene más de una localización in silico de acuerdo al fichero de [@price2013additional].
+4. Las que apuntan a  ADN repetitivo según el fichero de [@price2013additional].
+
+
+```{r supresion_sondas, eval=FALSE}
+
+GSE42409_df <- GSE42409@data
+GSE42409_df <- select(GSE42409_df, c(1,6,12,13,14))
+
+nombres_sondas <- data.frame(sondas = row.names(data))
+nombres_sondas <- filter(nombres_sondas, substring(sondas, 1, 2) == "cg")
+
+sondas <- merge(nombres_sondas, GSE42409_df, by.x="sondas", by.y="ID", all.x=TRUE)
+
+sondas_dep <-filter(sondas, (`Target CpG SNP`=="" &
+                      AlleleA_Hits == 1 &
+                      AlleleB_Hits == 0 &
+                      n_bp_repetitive == 0) | is.na(`Target CpG SNP`))
+
+data_dep <- data[row.names(data) %in% sondas_dep$sondas , ]
+      
+
+```
+
+### Selección de las muestras tipos 01 TP y 03 TB tumores primarios
+
+```{r , eval=FALSE}
+
+codigos <- c("01", "03")
+data_sondas_dep <- data_sondas_dep[ , data_sondas_dep$categoria %in% codigos]
+
+```
+
+
+## Selección de las 20000 sondas de mayor desviación estándar
+
+### Cálculo desviaciones estandar
+
+```{r , eval=FALSE}
+
+betas <- assay(data_sondas_dep, "counts")
+sds <- apply(betas, 1, sd)
+
+rowRanges(data_sondas_dep)$sd <- sds
+
+save(data_sondas_dep, file="G:/TFM UOC/datos/Clasificador_variabilidad/data_sondas_dep_sd.Rda")
+
+```
+
+### Selección de las 20000 sondas de mayor desviación estándar
+
+```{r calculo_sd, eval= FALSE}
+
+selecciona_sondas <- function(data, n=20000){
+  sds <- rowRanges(data)$sd
+  orden <- order(sds, decreasing=TRUE)
+  sds_o <- sds[orden][1:n]
+  d <- data[names(sds_o)]
+}
+
+n = 20000
+
+sondas_20000 <- selecciona_sondas(data_sondas_dep, n)
+save(sondas_20000, file="G:/TFM UOC/datos/Clasificador_variabilidad/sondas_20000.Rda")
+
+```
+
+### Distribución de las desviaciones tipicas
+
+```{r sd, cache=TRUE}
+
+load(file="G:/TFM UOC/datos/Clasificador_variabilidad/sondas_20000.Rda")
+sondas_20000
+
+df <- rowRanges(sondas_20000)$sd 
+df <- data.frame(sd = df)
+
+summary(df$sd)
+
+ggplot(data = df , aes(x=sd)) +
+  geom_histogram(aes( fill = ..count..), bins=30) +
+  scale_fill_gradient(low="#DCDCDC", high = "#7C7C7C") +
+  ggtitle("Histograma desviaciones estándar") 
+
+```
+
+
+## Desglose de las muestras en los grupos train y test
+
+Se desglosa el objeto summarized experiment que contiene todas las muestras, en dos, un grupo train con el 75 % de las muestras y un grupo test con el resto. Se usa la función `createDataPartition` de la librería `caret`.
+
+```{r desglose_train_test, cache=TRUE}
+
+set.seed(123)
+etiqueta <- sondas_20000$label
+
+in_train <- createDataPartition(etiqueta, p=0.75, list=FALSE) %>% as.vector()
+
+train <- sondas_20000[ , in_train]
+test <- sondas_20000[ , -in_train] 
+train
+test
+
+comprueba <- function(data){
+  f <- colnames(data) != data$bar_code
+  sum(f)
+}
+
+comprueba(train)
+comprueba(test)
+
+
+```
+
+
+### Tabla de distribución de muestras entre train y test
+
+Se detalla la distribución entre los grupos train y test de las muestras.
+
+```{r subsetting_sondas, warning=FALSE, message=FALSE, cache=TRUE}
+
+t1 <- train$label %>% table() %>% as.matrix()
+t2 <- test$label %>% table() %>% as.matrix()
+
+df <- data.frame(Train= table(train$label), 
+                 Test = table(test$label),
+                 Total = t1+t2)
+
+df[, c(2,4,5) ] %>% kable()
+
+```
+
+### Tabla de ubicaciones de las sondas seleccionadas
+
+Se detalla los cromosomas a los que se mapean las 20.000 sondas seleccionadas.
+
+```{r ubicaciones_sondas, warning=FALSE, message=FALSE}
+
+rowRanges(train) %>% seqnames() %>% table() 
+
+```
+
+
+### Tabla con la tipología de las sondas seleccionadas
+
+El desglose de las sondas seleccionadas entre Tipo I (Green y Red) y Tipo II (Both)
+
+```{r tipos_sondas, warning=FALSE, message=FALSE}
+
+rowRanges(train)$channel %>% table() %>% kable()
+
+```
+
+### Tabla con tipos de targets HIL en las sondas seleccionadas
+
+```{r tabla_targets, message=FALSE, warning=FALSE, cache=TRUE}
+
+elist <- getGEO("GSE42409")
+GSE42409 <- elist[[1]] %>% featureData()
+
+GSE42409$HIL_CpG_class[GSE42409$ID %in% names(train)]  %>%  table() %>%  kable()
+
+```
+
+
+# Análisis gráfico previo de los beta-values
+
+Se utilizan para construir los gráficos tan solo las muestras del grupo train.
+
+
+```{r datos_train, cache=TRUE}
+
+train_data <- assay(train, "counts") %>%  t()
+label <- train$label %>% factor()
+
+```
+
+
+## Gráfico previo Rtsne
+
+Tan solo utilizaremos los datos train:
+
+```{r Rtsne_grafico, message=FALSE, warning=FALSE, cache=TRUE}
+
+sed.seed=123
+tsne <- Rtsne(train_data, partial_pca=TRUE, dims=2, perplexity=30, verbose =FALSE, max_iter=1000 )
+
+# Gráfico por patologías
+tsne_plot <- data.frame(x = tsne$Y[,1], y = tsne$Y[,2], col = label)
+ggplot(tsne_plot) + geom_point(aes(x=x, y=y, color=col), size=0.2)
+
+```
+
+Muchos tumores aparecen claramente diferenciados en el gráfico, sin embargo, otros se presume que va a ser difícil de discriminar con la información contenida en los beta-values de las 20.000 sondas seleccionadas.
+
+
+## Gráfico revisión normalidad de las sondas
+
+Se muestra el histograma de los valores betas de una sonda elegida aleatoriamente para las muestras del estudio BRCA
+
+```{r grafico_normalidad, cache=TRUE}
+
+label_g <- as.character(label)
+l <- label_g[label == "BRCA" ] 
+
+df <- data.frame(betas = train_data[ label =="BRCA" , sample(1:dim(train_data)[2], 1)], label = l )
+
+ggplot(data = df , aes(x=betas)) +
+  geom_histogram(aes(y=..density.., fill = ..count..)) +
+  scale_fill_gradient(low="#DCDCDC", high = "#7C7C7C") +
+  stat_function(fun=dnorm, colour="#0C3D7D9F", args=list(mean=mean(df$betas), sd = sd(df$betas))) +
+  ggtitle(colnames(train_data)[1]) + facet_grid( . ~ df$label)
+
+```
+
+No podemos presumir que los valores betas se distribuyan normalmente ni en el conjunto de todas las muestras ni dentro de cada tumor en particular. Esto sería un impedimento en una clasificador que utilizara la regresión logística, sin embargo no aparece como restricción ni en los algoritmos red neuronal ni random forest que son los que aplicaremos seguidamente.
+
+## Histograma de los valores beta
+
+```{r histograma, warning=FALSE, message=FALSE, cache=TRUE}
+
+boxplot(train_data ~ label, cex.axis=0.5, las=3, col=palette("Polychrome 36"))
+
+```
+
+El histograma de valores betas por tumor (solo consideradas las 20.000 sondas seleccionadas) muestra diferencias significativas entre los diferentes tumores, sin embrago el grupo de control representado en el séptimo lugar no se identifica o discrimina claramente con respecto al resto.
+
+
+# El clasificador RED neuronal
+
+## Desglose de las sondas de acuerdo al tipo de sonda
+
+Se desglosan las sondas en los grupos "Green" y "Red", sondas tipo I y "Both" sondas tipo II de acuerdo a las anotaciones de Illumina 450k. También se preparan las etiquetas de las muestras (el tumor al que pertenecen) para poder incorporarse a la red neuronal: se convierte un factor (label) en un array con el procedimiento One-hot encoding.
+
+```{r desglose_sondas_tipos, cache=TRUE}
+
+train_data <- assay(train, "counts") %>%  t()
+label <- train$label %>% factor()
+label_c <- to_categorical(as.integer(label))
+
+tipos_sondas <- rowData(train)$channel %>%  as.factor()
+train_green_data <- train_data[ , tipos_sondas=="Grn"]
+train_red_data <- train_data[ , tipos_sondas == "Red"]
+train_both_data <- train_data[ , tipos_sondas =="Both"]
+
+```
+
+
+## Formulación del modelo
+
+Código adaptado de [@chollet2018deep]
+
+```{r modelo, cache=TRUE, fig.align='center'}
+
+build_model <- function() {
+  green <- layer_input(shape= dim(train_green_data)[[2]], name="green")
+  red <- layer_input(shape= dim(train_red_data)[[2]], name="red")
+  both <- layer_input(shape= dim(train_both_data)[[2]], name="both")
+  
+  salida_green <- green %>% 
+    layer_dense(units=64, activation="relu", name ="dense_green")
+    
+  salida_red <- red %>% 
+    layer_dense(units=64, activation="relu", name="dense_red")  
+    
+  salida_tipo_I <- layer_concatenate(list(salida_green, salida_red),
+                                     name = "Tipo_I")
+  
+  tipo_I <- salida_tipo_I %>% 
+    layer_dense(units = 32, activation = "relu", name="dense_Tipo_I")
+  
+  tipo_II <- both %>% 
+    layer_dense(units=64, activation="relu", name="dense_Tipo_II_1") %>% 
+    layer_dense(units=32, activation="relu", name = "dense_Tipo_II_2")
+  
+  concatenated <- layer_concatenate(list(tipo_I, tipo_II), name="Entrada_Tipo_I_TipoII")
+    
+  salida <- concatenated %>% 
+    layer_dense(units=64, activation = "relu", name="dense_conjunta") %>% 
+    layer_dense(units=34, activation = "softmax", name="salida")
+  
+    
+  model <- keras_model(list(green, red, both), salida)
+     
+  model %>%  compile(
+    optimizer = "rmsprop",
+    loss = "categorical_crossentropy",
+    metrics = c("accuracy")
+  )
+}
+
+build_model() %>% summary()
+
+```
+
+El grafo de modelo extraído de tensorboard:
+
+
+![](C:/TFM UOC/R/TensorBoard_grafo.png){width=50%, height=50%}
+
+
+## Validación cruzada para determinar la capacidad predictiva del modelo
+
+Se realiza la validación cruzada con 4 particiones, pliegues. El grupo train se divide en 4 bloques, se entrena el modelo con tres de ellos, validándose con el restante. Una vez entrenado y validado el modelo las cuatro veces, el `accuracy` propuesto es la media de los 4 valores obtenidos.   
+
+Código adaptado de [@chollet2018deep]
+
+```{r validacion_cruzada, cache=TRUE}
+
+k=4
+folds <- createFolds(label, k)
+
+num_epoch = 40
+all_scores = c()
+
+for (i in 1:k) {
+  cat("procesing fold #", i, "\n")
+  partial_green_data <- train_green_data[ -folds[[i]] , ]
+  partial_red_data <- train_red_data[ -folds[[i]] , ]
+  partial_both_data <- train_both_data[ -folds[[i]] , ]
+  partial_train_label <- label_c[-folds[[i]] , ]
+  
+  val_green_data <- train_green_data[folds[[i]] , ]
+  val_red_data <- train_red_data[folds[[i]] , ]
+  val_both_data <- train_both_data[folds[[i]] , ]
+  val_label <- label_c[folds[[i]],]
+  
+  model <- build_model()
+  
+  history <- model %>% fit(list(partial_green_data, partial_red_data, partial_both_data ), 
+                partial_train_label,
+                epoch = num_epoch
+              )
+  
+  results <- model %>%  evaluate(list(val_green_data, val_red_data, val_both_data), val_label)
+  all_scores <- c(all_scores, results[2])
+  }
+
+all_scores
+mean(all_scores)
+
+```
+
+## Predicción con lo valores test utilizando el modelo con epoch 40 seleccionado
+
+Una vez ajustado el parámetro `epoch` al repetir la validación cruzada con varios valores, el modelo elegido final, que se entrena con todos los valores del subset train,  se evalúa con los datos de test.
+
+### Preparación de los datos del subset test
+
+
+```{r prediccion_test, cache=TRUE}
+
+betas_test <- assay(test, "counts") %>% t()
+
+test_green_data <- betas_test[ , tipos_sondas=="Grn"]
+test_red_data <- betas_test[ , tipos_sondas == "Red"]
+test_both_data <- betas_test[ , tipos_sondas =="Both"]
+
+fenotipos_test <- colData(test)$label %>% factor(ordered=TRUE)
+test_labels <- to_categorical(as.integer(fenotipos_test))
+
+```
+
+### Entrenamiento del modelo con todos los datos train
+
+```{r entrenamiento_test, cache=TRUE}
+
+modelo <- build_model()
+
+num_epoch = 40
+history <- modelo %>% fit(list(train_green_data, train_red_data, train_both_data ), 
+                         label_c,
+                         epoch = num_epoch,
+                         validation_data=list(list(test_green_data, test_red_data, test_both_data ),
+                                              test_labels)
+                         )
+
+plot(history)
+                         
+metrics <- modelo %>% evaluate(list(test_green_data, test_red_data, test_both_data), test_labels)
+metrics
+
+```
+
+### Matriz de contingencia de los resultados
+
+```{r matriz_contingencia, cache=TRUE}
+
+prediccion <- modelo %>% predict(list(test_green_data, test_red_data, test_both_data)) %>% 
+  k_argmax() %>% 
+  as.array() %>% as.integer()
+
+l <- as.list(1:34)
+names(l) <- levels(fenotipos_test)
+f <- names(l)[prediccion]
+lev <- levels(fenotipos_test)
+prediccion <- factor(f, levels=lev)
+
+c3 <- confusionMatrix(fenotipos_test, prediccion)
+c3
+
+```
+
+# Entrenamiento de la red usando las betas ajustadas con ComBat
+
+En este apartado ajustamos los valores betas por el posible efecto **batch** de la variable `plate_id`. El ajuste solo se realiza a los valores del subset train, dado que si aspiramos a emplear el algoritmo en muestras ajenas al proyecto TCGA, éstas no van a estar ajustadas por esa variable, propia delproyecto.
+
+## Ajuste de los valores betas del subset train con la función Combat
+
+```{r betas_combat, cache=TRUE}
+
+edata <- assay(train, "counts")
+pdata <- colData(train)
+
+nombres <- assay(train, "counts") %>% colnames()
+plate_id <- TCGAbiospec(nombres) 
+plate_id <- plate_id$plate
+
+train$plate_id <- plate_id
+
+```
+
+
+```{r dos, cache=TRUE, message=FALSE, warnings=FALSE}
+
+mod0 <- model.matrix( ~ 1, data = pdata)
+mod <- model.matrix( ~ as.factor(label), data = pdata)
+
+combat_edata <- ComBat(dat = edata, batch = plate_id,
+                       mod = mod0, mean.only=TRUE, par.prior=TRUE)
+
+assay(train, "counts") <- combat_edata
+
+
+```
+
+
+```{r tres, cache=TRUE}
+
+train_data <- assay(train, "counts") %>%  t()
+label <- train$label %>% factor()
+label_c <- to_categorical(as.integer(label))
+
+tipos_sondas <- rowData(train)$channel %>%  as.factor()
+train_green_data <- train_data[ , tipos_sondas=="Grn"]
+train_red_data <- train_data[ , tipos_sondas == "Red"]
+train_both_data <- train_data[ , tipos_sondas =="Both"]
+
+```
+
+
+## Entrenamiento del modelo con los nuevos valores ajustados
+
+```{r entrenamiento_combat,  cache=TRUE}
+
+modelo <- build_model()
+
+history <- modelo %>% fit(list(train_green_data, train_red_data, train_both_data ), 
+                         label_c,
+                         epoch = num_epoch
+                         )
+
+plot(history)
+
+```
+
+## Evaluación del modelo
+
+```{r evaluacion_combat, cache=TRUE}
+
+metrics <- modelo %>% evaluate(list(test_green_data, test_red_data, test_both_data), test_labels)
+metrics
+
+```
+
+
+
+# Bibliografía

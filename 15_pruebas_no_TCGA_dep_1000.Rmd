@@ -1,0 +1,205 @@
+---
+title: 'Clasificador: prueba no TCGA (colonomics)'
+author: "Alberto Joven Álvarez"
+date: \ `r format(Sys.Date(), "%e de %B, %Y")`
+bibliography: ["scholar2.bib"]
+nocite: \ @*
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 2
+    number_sections: true
+  html_document: 
+    higlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+    number_sections: true
+    toc_float: yes
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Lista de librerías empleadas
+
+```{r librerias, warning=FALSE, message=FALSE}
+
+library(knitr)
+library(dplyr)
+library(readr)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(FDb.InfiniumMethylation.hg19)
+library(impute)
+library(SummarizedExperiment)
+library(GEOquery)
+library(caret)
+library(ggplot2)
+library(keras)
+
+```
+
+# Entrenamiento del modelo red neuronal con 1.000 sondas más variables.
+
+## Carga de los datos: obteto summarizedExperiment y desglose por tipo de sonda
+
+Se han seleccionado las 1.000 sondas más variables, una vez excluidas sondas problemáticas
+
+```{r}
+load("C:/Users/usuario/TFM/sondas_dep_1000.Rda")
+sondas_dep_1000
+
+train <- assay(sondas_dep_1000, "counts") %>%  t()
+label <- sondas_dep_1000$label %>% factor()
+label_c <- to_categorical(as.integer(label))
+
+
+```
+
+## El modelo
+
+```{r}
+build_model <- function() {
+  
+  model <- keras_model_sequential() %>% 
+    layer_dense(units=64, activation="relu", input_shape=dim(train)[[2]]) %>% 
+    layer_dense(units=32, activation="relu") %>% 
+    layer_dense(units=64, activation = "relu") %>% 
+    layer_dense(units=35, activation = "softmax")
+  
+  
+  model %>%  compile(
+    optimizer = "rmsprop",
+    loss = "categorical_crossentropy",
+    metrics = c("accuracy")
+  )
+  
+ 
+}
+
+build_model() %>% summary()
+```
+
+## Entrenamiento del modelo con todas las observaciones
+
+Solo estan las muestras de tumores primarios.
+
+```{r entrenamiento_modelo}
+modelo <- build_model()
+
+num_epoch = 40
+history <- modelo %>% fit(train, label_c, epoch= num_epoch)
+
+plot(history)
+
+# save_model_hdf5(modelo, "G:/TFM UOC/datos/Clasificador_variabilidad/modelo_dep_1000.h5")
+
+modelo <- load_model_hdf5("C:/Users/usuario/TFM/modelo_1000.h5", compile=FALSE)
+```
+
+#  Predicción con los datos de colonomics
+
+## Carga de los datos
+
+```{r colonomics}
+
+betas_colonomics <- read_csv("G:/TFM UOC/datos/test_colonomics/CLX_methylation_betas_2014Apr25.txt")
+betas_colonomics[1:5, 1:5] 
+dim(betas_colonomics)
+betas <- as.matrix(betas_colonomics[, 2:dim(betas_colonomics)[2]])
+
+sondas_c <- betas_colonomics[ , 1]
+row.names(betas) <- sondas_c$cpg
+betas[1:3, 1:5]
+dim(betas)
+
+
+```
+
+## Estimación de datos de las sondas que faltan en colonomics
+
+Primero se crea un data.frame con los nombres de las 1.000 sondas más variables, y con la función `merge` se le añaden los datos betas del proyecto colonomics
+
+```{r}
+# se crea el data frame con solo el nombre de las filas: las 1.000 sondas más variables
+betas_s <- data.frame(row.names=row.names(sondas_dep_1000))
+
+# con merge se le añaden los valores betas de colonomics
+betas_s2 <- merge(betas_s, betas, by.x=0, by.y=0, all.x=TRUE)
+
+# Vemos que existen NAs en las sondas que faltan en colonomics
+betas_s2[1:5, 1:5]
+
+# Se nombran las filas con la primera columna
+row.names(betas_s2) <- betas_s2$Row.names
+
+# Se elimina la primera columna que tenía el nombre de las sondas
+betas_s2 <- betas_s2[ , 2:dim(betas_s2)[2]]
+
+# se reordena el data.frame con las betas de colonomics para que
+# las sondas estén en el mismo orden que en el modelo red_neuronal
+betas_s <- betas_s2[row.names(sondas_dep_1000), ]
+dim(betas_s)
+betas_s[1:5, 1:5]
+
+```
+
+## Estimación de los valores faltantes con `impute` 
+
+Se estiman los valores faltantes con la función `impute.knn` y se dividen por 1.000 para obtener los valores betas en tanto por uno
+
+```{r}
+
+betas_s_sna <- impute.knn(as.matrix(betas_s))$data / 1000
+betas_s_sna[1:5, 1:5]
+
+
+```
+
+En el mensaje de aviso vemos que había 6 sondas en el subset de sondas más variables que no estaban en los datos de colonomics
+
+## Carga valores de fenotipos de colonomics
+
+```{r}
+
+fenotipos <- read_csv("G:/TFM UOC/datos/test_colonomics/CLX_ClinicalData.csv")
+
+# selección de los fenotipos incluidos en la matriz de valores betas de colonomics
+fenotipos_s <- intersect(fenotipos$id_clx, colnames(betas_s_sna))
+fenotipos_r <- fenotipos[fenotipos$id_clx %in% fenotipos_s, ]
+
+# selección de las muestras de colonomics para las que tenemos valor de fenotipo
+# y trasposición de la matriz
+betas_s_sna <- betas_s_sna[ , fenotipos_s] %>%  t()
+
+dim(betas_s_sna)
+sum(fenotipos_r$id_clx != rownames(betas_s_sna))
+
+table(fenotipos_r$type)
+
+colonomics <- betas_s_sna
+
+```
+ya tenemos `r dim(betas_s_sna)[1]`  muestras con su matriz de betas de las 1.000 sondas más variables y sus valores de fenotipos
+
+
+## predicción con las betas de colonomics
+
+```{r final}
+prediccion <- modelo %>% predict(colonomics) %>% 
+  k_argmax() %>% 
+  as.array() %>% as.integer()
+
+l <- as.list(1:34)
+names(l) <- levels(label)
+f <- names(l)[prediccion]
+table(prediccion = f, real_colonomics= fenotipos_r$type)
+
+```
+
+
+
+# Bibliografía
+

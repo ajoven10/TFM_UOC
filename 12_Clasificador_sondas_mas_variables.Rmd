@@ -1,0 +1,408 @@
+---
+title: "Clasificador diseasescodes TCGA sondas con mayor variabilidad"
+author: "Alberto Joven Álvarez"
+date: \ `r format(Sys.Date(), "%e de %B, %Y")`
+bibliography: ["scholar2.bib"]
+nocite: \ @*
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 2
+    number_sections: true
+  html_document: 
+    higlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+    number_sections: true
+    toc_float: yes
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r librerias, warning=FALSE, message=FALSE}
+
+library(knitr)
+library(SummarizedExperiment)
+library(GEOquery)
+library(Rtsne)
+library(ggplot2)
+library(dplyr)
+library(sva)
+library(caret)
+library(class)
+library(C50)
+library(gmodels)
+library(keras)
+library(randomForest)
+library(googledrive)
+library(doParallel)
+library(TCGAutils)
+registerDoParallel(cores=3)
+
+```
+
+# Clasificador machine learning de muestras tumorales.
+
+## Descripción datos de entrada
+
+En este clasificador, como datos de entrada, se utilizaránn las sondas seleccionadas con el criterio de selección d elas 10.000 sondas con mayor variabilidad.
+Arrays: Illumina methylation 450k.   
+
+## Descarga de las anotaciones adicionales de las sondas
+
+```{r descarga_GSE42409, warning=FALSE, message=FALSE, cache=TRUE}
+
+elist <- getGEO("GSE42409")
+GSE42409 <- elist[[1]] %>% featureData()
+
+# chequeo variables GSE42409
+sum(GSE42409$`Target CpG SNP` != "")
+table(GSE42409$`n_target CpG SNP`, useNA = "always")
+sum(GSE42409$SNPprobe != "")
+table(GSE42409$n_SNPprobe, useNA="always")
+table(GSE42409$n_bp_repetitive, useNA="always")
+table(GSE42409$AlleleA_Hits, useNA = "always")
+table(GSE42409$AlleleB_Hits, useNA = "always")
+
+```
+
+
+## Carga inicial de los datos
+
+Carga del objeto **SummarizedExperiment** que contiene los valores betas, valores de fenotipos y rangos de todas las sondas y todos los pacientes de todos 33 estudios existentes en TCGA referidos a metilación, analizados con el array Illumina 450k.  
+
+Únicamente se han excluido las sondas con NAs en más de un 10% de las observaciones.
+
+```{r carga_Summarized_Experiment, message=FALSE, warning=FALSE, eval=FALSE}
+#############################################################
+# ESTE SCRIPT NO SE EJECUTA EN EL CUADERNO RMARKDOWN PORQUE DA 
+# ERROR DE MEMORIA SOBREPASADA. EL ARCHIVO 
+# SummarizedExperimen.Rda tiene un tamaño de más de 30 Gb.
+# SE HA EJECUTADO COMO SCRIPT INDEPENDIENTE
+# Y PARA EL ANÁLISIS SE CARGAN LOS FICHEROS FINALES RESULTANTES
+############################################################
+
+
+# Carga del objeto Summarized Experiment con 9707 muestras
+# y 395312 sondas
+# se han eliminado previamente las sondas con más del 10% de muestras con NAs
+# sondas del array completo 485577
+
+load("G:/TFM UOC/datos/SummarizedExperiment.Rda")
+data
+
+nombres_sondas <- row.names(data)
+substring(nombres_sondas, 1 , 2) %>% table()
+  
+# sondas a excluir:
+# Las que comienzan con rs o ch 1.674 sondas
+sondas_excluir_1 <- nombres_sondas[substring(nombres_sondas, 1 , 2 ) %in% c("ch", "rs")]
+
+# Las que tienen en la anotación adicional el campo `Target CpG SNP`no vacío
+sondas_excluir_2 <- nombres_sondas[sondas_en_GSE$`Target CpG SNP` != ""]
+
+# Las que tiene más de una localización in silico:
+sondas_excluir_3 <- nombres_sondas[sondas_en_GSE$AlleleA_Hits != 1]
+sondas_excluir_4 <- nombres_sondas[sondas_en_GSE$AlleleB_Hits != 0]
+
+# Las que apuntan a  ADN repetitivo
+sondas_excluir_5 <- nombres_sondas[sondas_en_GSE$n_bp_repetitive != 0]
+
+
+s1 <- union(sondas_excluir_1, sondas_excluir_2)
+s1 <- union(sondas_excluir_3, s1)
+s1 <- union(sondas_excluir_4, s1)
+s1 <- union(sondas_excluir_5, s1)
+
+data_sondas_dep <- data[!(nombres_sondas %in% s1)]
+data_sondas_dep
+rm(data)
+
+save(data_sondas_dep, file="G:/TFM UOC/datos/Clasificador_variabilidad/data_sondas_dep.Rda")
+
+######################################################
+# desglose entre muestras de entrenamiento y de test
+####################################################
+
+set.seed(123)
+etiqueta <- data_sondas_dep$label
+
+in_train <- createDataPartition(etiqueta, p=0.75, list=FALSE) %>% as.vector()
+
+train <- data_sondas_dep[ , in_train]
+test <- data_sondas_dep[ , -in_train] 
+
+save(train, file="G:/TFM UOC/datos/Clasificador_variabilidad/data_sondas_dep_train.Rda")
+save(test, file="G:TFM UOC/datos/Clasificador_variabilidad/data_sondas_dep_test.Rda")
+
+rm(data_sondas_dep)
+
+########################################################################
+# selección de las 10000 sondas con mayor variabilidad del grupo train
+########################################################################
+
+betas_train <- assay(train, "counts")
+sds <- apply(betas_train, 1, sd)
+orden <- order(sds, decreasing=T)
+sds_o <- sds[orden][1:10000]
+
+summarized_train <- train[names(sds_o) ]
+summarized_test <- test[names(sds_o) ]
+
+
+save(summarized_train, file="G:/TFM UOC/datos/Clasificador_variabilidad/summarized_train.Rda")
+save(summarized_test, file="G:TFM UOC/datos/Clasificador_variabilidad/summarized_test.Rda")
+
+
+rm(train, test, betas_train)
+
+
+```
+
+## Carga de los ficheros train y  test
+
+```{r carga_dicheros, warning=FALSE, message=FALSE}
+
+load("G:/TFM UOC/datos/Clasificador_variabilidad/summarized_train.Rda")
+load("G:/TFM UOC/datos/Clasificador_variabilidad/summarized_test.Rda")
+
+train <- summarized_train
+test <- summarized_test
+
+```
+
+
+## Tabla de distribución de muestras entre train y test
+
+```{r subsetting_sondas, warning=FALSE, message=FALSE}
+t1 <- train$label %>% table() %>% as.matrix()
+t2 <- test$label %>% table() %>% as.matrix()
+
+df <- data.frame(Train= table(train$label), 
+                 Test = table(test$label),
+                 Total = t1+t2)
+
+df[, c(2,4,5) ] %>% kable()
+
+```
+
+## Gráfico previo Rtsne
+
+```{r Rtsne_grafico, message=FALSE, warning=FALSE, cache=TRUE}
+betas_train <- assay(summarized_train, "counts") %>% t()
+etiqueta <- colData(summarized_train)$label
+
+sed.seed=123
+tsne <- Rtsne(betas_train, partial_pca=TRUE, dims=2, perplexity=30, verbose =FALSE, max_iter=1000 )
+
+# Gráfico por patologías
+tsne_plot <- data.frame(x = tsne$Y[,1], y = tsne$Y[,2], col = etiqueta)
+ggplot(tsne_plot) + geom_point(aes(x=x, y=y, color=col), size=0.2)
+
+
+```
+
+## Tabla ubicaciones sondas seleccionadas
+
+```{r ubicaciones_sondas, warning=FALSE, message=FALSE}
+
+rowRanges(train) %>% seqnames() %>% table() 
+
+
+```
+
+## Tabla con la tipología de las sondas seleccionadas
+
+```{r tipos_sondas, warning=FALSE, message=FALSE}
+
+rowRanges(train)$channel %>% table() %>% kable()
+
+```
+
+## Tabla con tipos de targets HIL en las sondas seleccionadas
+
+```{r tabla_targets, message=FALSE, warning=FALSE}
+
+GSE42409$HIL_CpG_class[GSE42409$ID %in% names(train)]  %>%  table() %>%  kable()
+
+```
+
+
+## Estimación efecto batch de la variable plate_id
+
+**ESTE CÓDIGO NO SE EJECUTA**
+
+```{r efecto_batch, message=FALSE, warning=FALSE, eval=FALSE}
+
+edata <- assay(train, "counts")
+pdata <- colData(train)
+
+nombres <- assay(train, "counts") %>% colnames()
+plate_id <- TCGAbiospec(nombres) 
+plate_id <- plate_id$plate
+
+train$plate_id <- plate_id
+
+mod0 <- model.matrix( ~ 1, data = pdata)
+mod <- model.matrix( ~ as.factor(label), data = pdata)
+
+combat_edata <- ComBat(dat = edata, batch = plate_id,
+                       mod = mod0, par.prior=TRUE)
+
+assay(summarized_train, "counts") <- combat_edata
+
+```
+
+
+
+## Algoritmo red neuronal
+
+
+### Preparación datos
+
+```{r datos_red_neuronal, message=FALSE, warning=FALSE}
+
+fenotipos_train <- colData(summarized_train)$label %>% factor(ordered=TRUE)
+fenotipos_test <- colData(summarized_test)$label %>% factor(ordered=TRUE)
+betas_train <- assay(summarized_train, "counts") %>% t()
+betas_test <- assay(summarized_test, "counts") %>% t()
+
+
+```
+
+### Formulación del modelo
+
+```{r formulacion_red_neuronal, warning=FALSE, message=FALSE}
+
+red <- keras_model_sequential() %>%
+  layer_dense(units = 1000, activation="relu", input_shape=10000) %>%
+  layer_dense(units = 200) %>%
+  layer_dense(units = 35, activation ="softmax")
+
+red %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+
+train_labels <- to_categorical(as.integer(fenotipos_train))
+test_labels <- to_categorical(as.integer(fenotipos_test))
+
+red
+
+```
+
+
+### Entrenamiento del modelo
+
+```{r train_red_neuronal, warning=FALSE, message=FALSE}
+
+hist <- red %>% fit(betas_train, train_labels, 
+                    epoch=40, batch_size=512,
+                    validation_data = list(betas_test, test_labels))
+plot(hist)
+
+
+```
+
+
+
+### Evaluación del modelo
+
+```{r test_red_neuronal, warning=FALSE, message=FALSE}
+metrics <- red %>% evaluate(betas_test, test_labels)
+metrics
+
+```
+
+
+
+### Matriz de confusión con el subset test
+
+```{r confusion_red_neuronal, warning=FALSE, message=FALSE}
+
+prediccion <- red %>% predict(betas_test) %>% k_argmax() %>% 
+              as.array() %>% as.integer()
+
+l <- as.list(1:34)
+names(l) <- levels(fenotipos_test)
+f <- names(l)[prediccion]
+lev <- levels(fenotipos_test)
+prediccion <- factor(f, levels=lev)
+
+c3 <- confusionMatrix(fenotipos_test, prediccion)
+c3
+
+```
+
+## Algoritmo randomforest with caret
+
+### Preparación de los datos
+
+```{r randomforet_with_caret, warning=FALSE, cache=TRUE, message=FALSE}
+
+betas_train <- assay(train, "counts") %>% t()
+fenotipos_train <- train$label %>% factor(ordered=TRUE)
+
+betas_test <- assay(test, "counts") %>% t()
+fenotipos_test <- test$label %>% factor(ordered=TRUE)
+
+be <- as.data.frame(betas_train)
+be$label <- fenotipos_train
+
+
+
+```
+
+
+### Entrenamiento del modelo
+
+```{r entrenamiento_random_forest, warning=FALSE, message=FALSE, cache=TRUE}
+
+ctrl <- trainControl(method ="repeatedcv",
+                     number=3, repeats=1,
+                     selectionFunction="best",
+                     savePredictions=TRUE,
+                     classProbs=TRUE, 
+                     verboseIter=TRUE,
+                     allowParallel=TRUE)
+
+grid_rf <- expand.grid(mtry = c(100))
+                              
+
+m_rf <- train(label ~ ., data=be, method="rf",
+              trControl=ctrl,
+              tuneGrid=grid_rf,
+              metric="Accuracy")
+
+m_rf
+
+
+```
+### Evaluación del modelo
+
+```{r evaluacion_random_forest, warning=FALSE, message=FALSE, cache=TRUE}
+
+resultado2 <- predict(m_rf, newdata=betas_test, type="raw")
+
+c5 <- confusionMatrix(fenotipos_test, resultado2)
+c5
+
+```
+
+
+## SessionInfo
+
+```{r}
+
+sessionInfo()
+
+```
+
+
+
+## Bibliografía
