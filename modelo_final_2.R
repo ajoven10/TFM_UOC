@@ -2,11 +2,12 @@ library(keras)
 library(caret)
 library(TCGAutils)
 library(sva)
+library(SummarizedExperiment)
+library(dplyr)
 
 ########################################################
 # Carga de los datos
 #######################################################
-
 load("C:/Users/usuario/TFM/sondas_dep_1000.Rda")
 sondas_dep_1000
 
@@ -35,6 +36,20 @@ build_model <- function() {
 
 build_model() %>% summary()
 
+####################################################
+# Desglose train y test
+########################################################
+set.seed(123)
+etiqueta <- sondas_dep_1000$label
+
+in_train <- createDataPartition(etiqueta, p=0.75, list=FALSE) %>% as.vector()
+
+train <- sondas_dep_1000[ , in_train]
+test <- sondas_dep_1000[ , -in_train]
+
+train_data <- assay(train, "counts")  %>% t()
+label <- train$label %>%  factor()
+label_c <- to_categorical(as.integer(label))
 
 ################################################################################
 # Validación cruzada
@@ -68,15 +83,52 @@ for (i in 1:k) {
 all_scores
 mean(all_scores)
 
+############################################
+# Validación del modelo usando los datos test
 ###########################################
-# Entrenamiento del modelo con todos los datos
+test_data <- assay(test, "counts") %>%  t()
+fenotipos_test <- test$label %>% factor()
+test_labels <- to_categorical(as.integer(fenotipos_test))
+
+modelo <- build_model()
+num_epoch = 40
+history <- modelo %>%  fit(train_data,
+                           label_c,
+                           epoch=num_epoch,
+                           validation_data=list(test_data, test_labels))
+plot(history)
+metrics <- modelo %>% evaluate(test_data, test_labels)
+metrics
+
+##############################################
+# Evaluación final del modelo
+############################################
+prediccion <- modelo %>% predict(test_data) %>% 
+  k_argmax() %>% 
+  as.array() %>% as.integer()
+
+l <- as.list(1:34)
+names(l) <- levels(fenotipos_test)
+f <- names(l)[prediccion]
+lev <- levels(fenotipos_test)
+prediccion <- factor(f, levels=lev)
+
+c3 <- confusionMatrix(data=prediccion, reference=fenotipos_test)
+c3$overall
+
+
 ###########################################
+# Entrenamiento del modelo con todos los datos sin distinción train test
+###########################################
+train_data <- assay(sondas_dep_1000, "counts") %>%  t()
+label <- sondas_dep_1000$label %>% factor()
+label_c <- to_categorical(as.integer(label))
+
 modelo <- build_model()
 
 history <- modelo %>% fit(train_data , 
                label_c,
                epoch = num_epoch )
-
 plot(history)
 
 
@@ -86,23 +138,9 @@ plot(history)
 # save_model_hdf5(modelo, "C:/Users/usuario/TFM/modelo_1000.h5")
 modelo <- load_model_hdf5("C:/Users/usuario/TFM/modelo_1000.h5")
 
-########################################
-# Prediccion valores de entrenamiento
-###########################################
 
-prediccion <- modelo %>% predict(train_data) %>% 
-  k_argmax() %>% 
-  as.array() %>% as.integer()
-
-l <- as.list(1:34)
-names(l) <- levels(label)
-f <- names(l)[prediccion]
-lev <- levels(label)
-prediccion <- factor(f, levels=lev)
-
-c3 <- confusionMatrix(label, prediccion)
-c3
-
+###############################################
+###############################################
 ##############################################
 # Ajuste valores betas con Combat: covariate: plate_id
 ##########################################
@@ -137,6 +175,21 @@ train_data <- assay(sondas_dep_1000, "counts") %>%  t()
 label <- sondas_dep_1000$label %>% factor()
 label_c <- to_categorical(as.integer(label))
 
+####################################################
+# Desglose train y test
+########################################################
+set.seed(123)
+etiqueta <- sondas_dep_1000$label
+
+in_train <- createDataPartition(etiqueta, p=0.75, list=FALSE) %>% as.vector()
+
+train <- sondas_dep_1000[ , in_train]
+test <- sondas_dep_1000[ , -in_train]
+
+train_data <- assay(train, "counts")  %>% t()
+label <- train$label %>%  factor()
+label_c <- to_categorical(as.integer(label))
+
 
 ################################################################################
 # Validación cruzada
@@ -170,9 +223,46 @@ for (i in 1:k) {
 all_scores
 mean(all_scores)
 
+############################################
+# Validación del modelo usando los datos test
 ###########################################
-# Entrenamiento del modelo con todos los datos
+test_data <- assay(test, "counts") %>%  t()
+fenotipos_test <- test$label %>% factor()
+test_labels <- to_categorical(as.integer(fenotipos_test))
+
+modelo <- build_model()
+num_epoch = 40
+history <- modelo %>%  fit(train_data,
+                           label_c,
+                           epoch=num_epoch,
+                           validation_data=list(test_data, test_labels))
+plot(history)
+metrics <- modelo %>% evaluate(test_data, test_labels)
+metrics
+
+##############################################
+# Evaluación final del modelo 
+############################################
+prediccion <- modelo %>% predict(test_data) %>% 
+  k_argmax() %>% 
+  as.array() %>% as.integer()
+
+l <- as.list(1:34)
+names(l) <- levels(fenotipos_test)
+f <- names(l)[prediccion]
+lev <- levels(fenotipos_test)
+prediccion <- factor(f, levels=lev)
+
+c3 <- confusionMatrix(data=prediccion, reference=fenotipos_test)
+c3$overall
+
 ###########################################
+# Entrenamiento del modelo con todos los datos sin distinción train test
+###########################################
+train_data <- assay(sondas_dep_1000, "counts") %>%  t()
+label <- sondas_dep_1000$label %>% factor()
+label_c <- to_categorical(as.integer(label))
+
 modelo <- build_model()
 
 history <- modelo %>% fit(train_data, 
@@ -185,23 +275,8 @@ plot(history)
 ##############################################
 # Se guarda el modelo final
 ####################################
-save_model_hdf5(modelo, "C:/Users/usuario/TFM/modelo_1000_combat.h5")
+# save_model_hdf5(modelo, "C:/Users/usuario/TFM/modelo_1000_combat.h5")
 
 
-########################################
-# Prediccion valores de entrenamiento
-###########################################
 
-prediccion <- modelo %>% predict(train_data) %>% 
-  k_argmax() %>% 
-  as.array() %>% as.integer()
-
-l <- as.list(1:34)
-names(l) <- levels(label)
-f <- names(l)[prediccion]
-lev <- levels(label)
-prediccion <- factor(f, levels=lev)
-
-c3 <- confusionMatrix(label, prediccion)
-c3
 
